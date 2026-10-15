@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime, timedelta, time as dtime
 from functools import wraps
+from contextlib import contextmanager
 from zoneinfo import ZoneInfo
 
 import telebot
@@ -41,10 +42,18 @@ HELP_TEXT = (
     "/status — show today's schedule and message counts"
 )
 
+@contextmanager
 def connect():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
     with db_lock, connect() as conn:
@@ -180,6 +189,15 @@ def send_scheduled(kind, day):
 
     tx(lambda conn: set_slot(conn, day, kind, "sent", f"message #{msg_id}"))
     log.info("%s posted for %s", kind.upper(), day)
+
+def recover_stale(conn):
+    rows = conn.execute(
+        "SELECT day,kind FROM slots WHERE status='sending'"
+    ).fetchall()
+    for row in rows:
+        set_slot(conn, row["day"], row["kind"], "unknown",
+                 "process restarted while sending; check channel before retrying")
+    return [(row["day"], row["kind"]) for row in rows]
 
 def scheduler():
     while True:
@@ -320,6 +338,12 @@ if __name__ == "__main__":
     init_db()
     today = datetime.now(TZ).strftime("%Y-%m-%d")
     tx(lambda conn: ensure_plan(conn, today))
+    stale = tx(recover_stale)
     threading.Thread(target=scheduler, daemon=True, name="scheduler").start()
+    for day, kind in stale:
+        notify_admin(
+            f"⚠️ {kind.upper()} ({day}) was marked unknown after restart. "
+            "Check the channel before manually resending."
+        )
     log.info("Bot started; timezone Asia/Kolkata")
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
