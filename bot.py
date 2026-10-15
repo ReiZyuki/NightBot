@@ -5,16 +5,18 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, time as dtime
-from functools import wraps
-from contextlib import contextmanager
+from functools import partial
 from zoneinfo import ZoneInfo
 
+import requests
+import urllib3
 import telebot
 from telebot.apihelper import ApiTelegramException
 
-# ---------- Railway environment variables ----------
+# ---------- Config (Railway Variables) ----------
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]
+CHANNEL_ID = os.environ["CHANNEL_ID"]  # -100xxxxxxxxxx ya @channelusername
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8469326059"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "gmgn.db")
@@ -27,323 +29,494 @@ POLL_SECONDS = 30
 
 os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("nightbot")
+log = logging.getLogger("gmbot")
+
 bot = telebot.TeleBot(BOT_TOKEN)
-db_lock = threading.RLock()
+db_lock = threading.Lock()
 
 HELP_TEXT = (
     "👋 GM/GN Channel Bot\n\n"
-    "/add_gm <message> — add a GM message\n"
-    "/add_gn <message> — add a GN message\n"
-    "/list_gm and /list_gn — view saved messages\n"
-    "/del_gm <id> and /del_gn <id> — delete a message\n"
-    "/resend_gm yes /resend_gn yes — send manually if not sent\n"
-    "/resend_gm force /resend_gn force — confirm an unknown post was not sent\n"
-    "/status — show today's schedule and message counts"
+    "➕ /add_gm <message>\n"
+    "➕ /add_gn <message>\n"
+    "📜 /list_gm  |  /list_gn\n"
+    "🗑 /del_gm <id>  |  /del_gn <id>\n"
+    "🔁 /resend_gm  |  /resend_gn (instructions dikhata hai)\n"
+    "📊 /status"
 )
 
-@contextmanager
-def connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+SAFE_RETRY, PERMANENT, UNKNOWN = "safe_retry", "permanent", "unknown"
+
+# ---------- SQLite helpers ----------
 
 def init_db():
-    with db_lock, connect() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL CHECK(kind IN ('gm','gn')),
-            text TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS state (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        CREATE TABLE IF NOT EXISTS slots (
-            day TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            status TEXT NOT NULL,
-            detail TEXT DEFAULT '',
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(day, kind)
-        );
-        """)
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind       TEXT NOT NULL CHECK (kind IN ('gm', 'gn')),
+                text       TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS state (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS slots (
+                day        TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                detail     TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (day, kind)
+            );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
 
 def query(sql, params=()):
-    with db_lock, connect() as conn:
-        return conn.execute(sql, params).fetchall()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
 
 def execute(sql, params=()):
-    with db_lock, connect() as conn:
-        cur = conn.execute(sql, params)
-        return cur.rowcount
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
 
 def tx(fn):
-    with db_lock, connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    """fn(conn) ek atomic transaction me chalta hai.
+    fn ke andar query()/execute() mat call karna (db_lock deadlock hoga)."""
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH, isolation_level=None)
+        conn.row_factory = sqlite3.Row
         try:
+            conn.execute("BEGIN IMMEDIATE")
             result = fn(conn)
-            conn.commit()
+            conn.execute("COMMIT")
             return result
-        except Exception:
-            conn.rollback()
+        except BaseException:
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    log.exception("ROLLBACK fail hua")
             raise
+        finally:
+            conn.close()
 
-def get_state(key, default=None):
-    rows = query("SELECT value FROM state WHERE key=?", (key,))
-    return rows[0]["value"] if rows else default
-
-def put_state(conn, key, value):
+def upsert_state(conn, key, value):
     conn.execute(
-        "INSERT INTO state(key,value) VALUES(?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        "INSERT INTO state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
 
-def random_time(window):
-    start, end = window
-    start_min = start.hour * 60 + start.minute
-    end_min = end.hour * 60 + end.minute
-    minute = random.randint(start_min, end_min)
-    return f"{minute // 60:02d}:{minute % 60:02d}"
+def get_state(key, default=None):
+    rows = query("SELECT value FROM state WHERE key = ?", (key,))
+    return rows[0]["value"] if rows else default
 
-def ensure_plan(conn, day):
-    row = conn.execute("SELECT value FROM state WHERE key='plan_date'").fetchone()
-    if row and row["value"] == day:
+def rand_time(window):
+    start, end = window
+    s = start.hour * 60 + start.minute
+    e = end.hour * 60 + end.minute
+    m = random.randint(s, e)
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+# ---------- Error classification ----------
+
+def _reaches_connect_stage(exc):
+    """Exception chain me dekho ki fail connect stage pe hua (request Telegram tak gayi hi nahi)."""
+    stack, seen = [exc], set()
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, (
+            urllib3.exceptions.ConnectTimeoutError,
+            urllib3.exceptions.NewConnectionError,
+        )):
+            return True
+        stack.extend([
+            getattr(e, "__cause__", None),
+            getattr(e, "__context__", None),
+            getattr(e, "reason", None),
+        ])
+    return False
+
+def classify(exc):
+    """Returns (verdict, reason).
+    SAFE_RETRY : message bhejne se pehle hi fail (connect stage) ya 429 -> retry safe
+    PERMANENT  : Telegram ne 4xx diya -> retry nahi, config check karo
+    UNKNOWN    : request gayi par jawab nahi mila / 5xx / baaki sab -> auto-retry nahi"""
+    if isinstance(exc, ApiTelegramException):
+        code = exc.error_code
+        desc = getattr(exc, "description", None) or str(exc)
+        if code == 429:
+            return SAFE_RETRY, "rate limit (429)"
+        if code is not None and 400 <= code < 500:
+            return PERMANENT, f"Telegram {code}: {desc}"
+        return UNKNOWN, f"Telegram {code}: {desc}"
+    if isinstance(exc, requests.exceptions.ConnectionError) and _reaches_connect_stage(exc):
+        return SAFE_RETRY, "connect stage pe fail, message Telegram tak nahi gaya"
+    return UNKNOWN, f"{type(exc).__name__}: {exc}"
+
+# ---------- Transaction-safe slot ops ----------
+
+def ensure_plan(conn, today):
+    row = conn.execute("SELECT value FROM state WHERE key = 'plan_date'").fetchone()
+    if row and row["value"] == today:
         return
-    put_state(conn, "plan_date", day)
-    put_state(conn, "gm_time", random_time(GM_WINDOW))
-    put_state(conn, "gn_time", random_time(GN_WINDOW))
+    upsert_state(conn, "plan_date", today)
+    upsert_state(conn, "gm_time", rand_time(GM_WINDOW))
+    upsert_state(conn, "gn_time", rand_time(GN_WINDOW))
 
 def set_slot(conn, day, kind, status, detail=""):
     conn.execute(
-        "INSERT INTO slots(day,kind,status,detail) VALUES(?,?,?,?) "
-        "ON CONFLICT(day,kind) DO UPDATE SET status=excluded.status, "
-        "detail=excluded.detail, updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO slots (day, kind, status, detail) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(day, kind) DO UPDATE SET "
+        "status = excluded.status, detail = excluded.detail, updated_at = CURRENT_TIMESTAMP",
         (day, kind, status, detail),
     )
 
-def admin_only(func):
-    @wraps(func)
-    def wrapper(message, *args, **kwargs):
-        if message.from_user and message.from_user.id == ADMIN_ID:
-            return func(message, *args, **kwargs)
-        bot.reply_to(message, "Sorry, this command is only available to the bot admin.")
-    return wrapper
+def claim_slot(conn, day, kind):
+    """Returns (msg_id, text), 'empty', ya None (slot pehle se hai)."""
+    if conn.execute(
+        "SELECT 1 FROM slots WHERE day = ? AND kind = ?", (day, kind)
+    ).fetchone():
+        return None
+    msg = conn.execute(
+        "SELECT id, text FROM messages WHERE kind = ? ORDER BY RANDOM() LIMIT 1",
+        (kind,),
+    ).fetchone()
+    if msg is None:
+        return "empty"
+    set_slot(conn, day, kind, "sending", f"msg #{msg['id']}")
+    return msg["id"], msg["text"]
 
-def notify_admin(message):
-    try:
-        bot.send_message(ADMIN_ID, message)
-    except Exception:
-        log.exception("Could not notify admin")
+def release_slot(conn, day, kind):
+    conn.execute("DELETE FROM slots WHERE day = ? AND kind = ?", (day, kind))
 
-def choose_message(kind):
-    rows = query("SELECT id,text FROM messages WHERE kind=? ORDER BY RANDOM() LIMIT 1", (kind,))
-    return (rows[0]["id"], rows[0]["text"]) if rows else None
-
-def send_scheduled(kind, day):
-    def claim(conn):
-        existing = conn.execute(
-            "SELECT status,detail FROM slots WHERE day=? AND kind=?", (day, kind)
-        ).fetchone()
-        if existing:
-            return ("exists", existing["status"])
-        rows = conn.execute(
-            "SELECT id,text FROM messages WHERE kind=? ORDER BY RANDOM() LIMIT 1", (kind,)
-        ).fetchone()
-        if not rows:
-            set_slot(conn, day, kind, "skipped", "message list is empty")
-            return ("empty", None)
-        set_slot(conn, day, kind, "sending", f"message #{rows['id']}")
-        return ("send", (rows["id"], rows["text"]))
-
-    state, payload = tx(claim)
-    if state == "exists":
-        return
-    if state == "empty":
-        notify_admin(f"⚠️ {kind.upper()} was skipped today because its message list is empty.")
-        return
-
-    msg_id, message_text = payload
-    try:
-        bot.send_message(CHANNEL_ID, message_text)
-    except ApiTelegramException as exc:
-        code = getattr(exc, "error_code", None)
-        status = "failed" if code and 400 <= code < 500 else "unknown"
-        tx(lambda conn: set_slot(conn, day, kind, status, f"Telegram error {code}: {exc}"))
-        notify_admin(f"❌ {kind.upper()} post {status}: {exc}\nCheck the channel before manually resending.")
-        return
-    except Exception as exc:
-        tx(lambda conn: set_slot(conn, day, kind, "unknown", str(exc)))
-        notify_admin(f"⚠️ {kind.upper()} result is unknown: {exc}\nCheck the channel before resending.")
-        return
-
-    tx(lambda conn: set_slot(conn, day, kind, "sent", f"message #{msg_id}"))
-    log.info("%s posted for %s", kind.upper(), day)
+def skip_slot(conn, day, kind):
+    if conn.execute(
+        "SELECT 1 FROM slots WHERE day = ? AND kind = ?", (day, kind)
+    ).fetchone():
+        return False
+    set_slot(conn, day, kind, "skipped", "deadline nikal gaya")
+    return True
 
 def recover_stale(conn):
+    """Restart ke waqt jo slot 'sending' tha, uska result pata nahi -> unknown."""
     rows = conn.execute(
-        "SELECT day,kind FROM slots WHERE status='sending'"
+        "SELECT day, kind FROM slots WHERE status = 'sending'"
     ).fetchall()
     for row in rows:
-        set_slot(conn, row["day"], row["kind"], "unknown",
-                 "process restarted while sending; check channel before retrying")
+        set_slot(
+            conn, row["day"], row["kind"], "unknown",
+            "restart ke waqt send ho raha tha, channel check karo",
+        )
     return [(row["day"], row["kind"]) for row in rows]
 
+def manual_pick(conn, day, kind, word):
+    """Returns (state, payload):
+    ('already', status)    -> sent/sending hai, kuch nahi karna
+    ('need_force', detail) -> unknown slot, 'force' chahiye
+    ('need_yes', None)     -> failed/khaali slot, 'yes' chahiye
+    ('empty', None)        -> list khaali
+    ('ok', (msg_id, text)) -> claim ho gaya, ab send karo
+    """
+    row = conn.execute(
+        "SELECT status, detail FROM slots WHERE day = ? AND kind = ?",
+        (day, kind),
+    ).fetchone()
+    status = row["status"] if row else None
+    if status in ("sent", "sending"):
+        return "already", status
+    if status == "unknown" and word != "force":
+        return "need_force", row["detail"]
+    if status != "unknown" and word not in ("yes", "force"):
+        return "need_yes", None
+    msg = conn.execute(
+        "SELECT id, text FROM messages WHERE kind = ? ORDER BY RANDOM() LIMIT 1",
+        (kind,),
+    ).fetchone()
+    if msg is None:
+        return "empty", None
+    set_slot(conn, day, kind, "sending", f"manual msg #{msg['id']}")
+    return "ok", (msg["id"], msg["text"])
+
+# ---------- Helpers ----------
+
+def deadline_for(kind, planned_dt):
+    window_end = GM_WINDOW[1] if kind == "gm" else GN_WINDOW[1]
+    end_dt = datetime.combine(planned_dt.date(), window_end, tzinfo=TZ)
+    return min(planned_dt + timedelta(minutes=GRACE_MINUTES), end_dt)
+
+def notify_admin(text):
+    try:
+        bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        log.error("Admin notify fail: %s", e)
+
+def admin_only(func):
+    def wrapper(m):
+        if not m.from_user or m.from_user.id != ADMIN_ID:
+            bot.reply_to(m, "⛔ Ye bot sirf admin ke liye hai.")
+            return
+        return func(m)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+def failure_alert(kind, day, verdict, reason):
+    if verdict == PERMANENT:
+        return (
+            f"❌ {kind.upper()} ({day}) post fail hua.\n{reason}\n"
+            "Permanent error hai, auto-retry nahi hoga. Config check karo "
+            "(bot channel me admin hai? CHANNEL_ID sahi hai?)."
+        )
+    return (
+        f"⚠️ {kind.upper()} ({day}) ka result unknown hai.\n{reason}\n"
+        "Auto-retry nahi hoga taaki duplicate na ho. Channel check karo; "
+        f"agar post nahi hua to /resend_{kind} force bhejo."
+    )
+
+# ---------- Scheduler ----------
+
 def scheduler():
+    warned = set()
     while True:
         try:
             now = datetime.now(TZ)
-            day = now.strftime("%Y-%m-%d")
-            tx(lambda conn: ensure_plan(conn, day))
+            today = now.strftime("%Y-%m-%d")
+            tx(partial(ensure_plan, today=today))
+
             for kind in ("gm", "gn"):
-                planned = get_state(f"{kind}_time", "00:00")
-                hour, minute = map(int, planned.split(":"))
-                planned_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if now < planned_dt:
+                planned_text = get_state(f"{kind}_time")
+                if not planned_text:
                     continue
-                if now <= planned_dt + timedelta(minutes=GRACE_MINUTES):
-                    send_scheduled(kind, day)
-                else:
-                    def skip(conn, k=kind):
-                        row = conn.execute(
-                            "SELECT 1 FROM slots WHERE day=? AND kind=?", (day, k)
-                        ).fetchone()
-                        if not row:
-                            set_slot(conn, day, k, "skipped", "grace period expired")
-                    tx(skip)
+                planned = datetime.combine(
+                    now.date(),
+                    dtime.fromisoformat(planned_text),
+                    tzinfo=TZ,
+                )
+                if now < planned:
+                    continue
+
+                if query(
+                    "SELECT 1 FROM slots WHERE day = ? AND kind = ?",
+                    (today, kind),
+                ):
+                    continue
+
+                deadline = deadline_for(kind, planned)
+                if now > deadline:
+                    if tx(partial(skip_slot, day=today, kind=kind)):
+                        log.warning("%s skip", kind.upper())
+                        notify_admin(
+                            f"⚠️ Aaj ka {kind.upper()} skip ho gaya.\n"
+                            f"Planned: {planned:%H:%M} IST, deadline: {deadline:%H:%M} IST."
+                        )
+                    continue
+
+                claimed = tx(partial(claim_slot, day=today, kind=kind))
+                if claimed is None:
+                    continue
+                if claimed == "empty":
+                    if (kind, today) not in warned:
+                        warned.add((kind, today))
+                        log.warning("%s list khali hai", kind.upper())
+                        notify_admin(
+                            f"⚠️ {kind.upper()} list khali hai!\n"
+                            f"{deadline:%H:%M} IST tak message add karo, warna aaj ka {kind.upper()} skip ho jayega."
+                        )
+                    continue
+
+                msg_id, text = claimed
+                try:
+                    bot.send_message(CHANNEL_ID, text)
+                except Exception as e:
+                    verdict, reason = classify(e)
+                    if verdict == SAFE_RETRY:
+                        tx(partial(release_slot, day=today, kind=kind))
+                        log.warning("%s safe retry: %s", kind.upper(), reason)
+                        continue
+                    status = "failed" if verdict == PERMANENT else "unknown"
+                    tx(partial(set_slot, day=today, kind=kind, status=status, detail=reason))
+                    log.error("%s %s: %s", kind.upper(), status, reason)
+                    notify_admin(failure_alert(kind, today, verdict, reason))
+                    continue
+
+                tx(partial(
+                    set_slot, day=today, kind=kind, status="sent",
+                    detail=f"msg #{msg_id}",
+                ))
+                log.info("%s post ho gaya (msg #%s)", kind.upper(), msg_id)
         except Exception:
-            log.exception("Scheduler loop error")
+            log.exception("Scheduler error")
         time.sleep(POLL_SECONDS)
+
+# ---------- Commands (sirf private chat, sirf admin) ----------
 
 @bot.message_handler(commands=["start", "help"], chat_types=["private"])
 @admin_only
-def help_cmd(message):
-    bot.reply_to(message, HELP_TEXT)
+def help_cmd(m):
+    bot.reply_to(m, HELP_TEXT)
 
 @bot.message_handler(commands=["add_gm", "add_gn"], chat_types=["private"])
 @admin_only
-def add_msg(message):
-    kind = "gm" if message.text.split()[0].split("@")[0] == "/add_gm" else "gn"
-    parts = message.text.split(maxsplit=1)
+def add_msg(m):
+    kind = "gm" if m.text.split()[0].split("@")[0] == "/add_gm" else "gn"
+    parts = m.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        bot.reply_to(message, f"Usage: /add_{kind} Your message here")
+        bot.reply_to(m, f"Usage: /add_{kind} <message>")
         return
-    with db_lock, connect() as conn:
-        cur = conn.execute("INSERT INTO messages(kind,text) VALUES(?,?)", (kind, parts[1].strip()))
-        msg_id = cur.lastrowid
-    bot.reply_to(message, f"✅ Added {kind.upper()} message #{msg_id}.")
+    execute("INSERT INTO messages (kind, text) VALUES (?, ?)", (kind, parts[1].strip()))
+    count = query("SELECT COUNT(*) AS c FROM messages WHERE kind = ?", (kind,))[0]["c"]
+    bot.reply_to(m, f"✅ {kind.upper()} message add ho gaya (total: {count})")
 
 @bot.message_handler(commands=["list_gm", "list_gn"], chat_types=["private"])
 @admin_only
-def list_msgs(message):
-    kind = "gm" if message.text.split()[0].split("@")[0] == "/list_gm" else "gn"
-    rows = query("SELECT id,text FROM messages WHERE kind=? ORDER BY id", (kind,))
+def list_msgs(m):
+    kind = "gm" if m.text.split()[0].split("@")[0] == "/list_gm" else "gn"
+    rows = query("SELECT id, text FROM messages WHERE kind = ? ORDER BY id", (kind,))
     if not rows:
-        bot.reply_to(message, f"The {kind.upper()} message list is empty.")
+        bot.reply_to(m, f"{kind.upper()} list khali hai.")
         return
-    output = "\n\n".join(f"#{row['id']} — {row['text']}" for row in rows)
-    for start in range(0, len(output), 3500):
-        bot.send_message(message.chat.id, output[start:start + 3500])
+    output = "\n\n".join(f"#{row['id']} {row['text']}" for row in rows)
+    bot.send_message(m.chat.id, output[:4000])
 
 @bot.message_handler(commands=["del_gm", "del_gn"], chat_types=["private"])
 @admin_only
-def del_msg(message):
-    kind = "gm" if message.text.split()[0].split("@")[0] == "/del_gm" else "gn"
-    parts = message.text.split(maxsplit=1)
+def del_msg(m):
+    kind = "gm" if m.text.split()[0].split("@")[0] == "/del_gm" else "gn"
+    parts = m.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
-        bot.reply_to(message, f"Usage: /del_{kind} <id>")
+        bot.reply_to(m, f"Usage: /del_{kind} <id> (id /list_{kind} me dikhegi)")
         return
-    count = execute("DELETE FROM messages WHERE id=? AND kind=?", (int(parts[1]), kind))
-    bot.reply_to(message, "🗑 Message deleted." if count else "That message ID was not found.")
+    msg_id = int(parts[1].strip())
+    deleted = execute(
+        "DELETE FROM messages WHERE id = ? AND kind = ?", (msg_id, kind)
+    )
+    if deleted:
+        bot.reply_to(m, f"🗑 {kind.upper()} #{msg_id} delete ho gaya")
+    else:
+        bot.reply_to(m, "❌ Ye id nahi mili")
 
 @bot.message_handler(commands=["resend_gm", "resend_gn"], chat_types=["private"])
 @admin_only
-def resend(message):
-    kind = "gm" if message.text.split()[0].split("@")[0] == "/resend_gm" else "gn"
-    parts = message.text.split()
-    mode = parts[1].lower() if len(parts) > 1 else ""
-    day = datetime.now(TZ).strftime("%Y-%m-%d")
-    rows = query("SELECT status,detail FROM slots WHERE day=? AND kind=?", (day, kind))
-    status = rows[0]["status"] if rows else "pending"
-    detail = rows[0]["detail"] if rows else ""
+def resend(m):
+    kind = "gm" if m.text.split()[0].split("@")[0] == "/resend_gm" else "gn"
+    KIND = kind.upper()
+    parts = m.text.split()
+    word = parts[1].lower() if len(parts) > 1 else ""
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
 
-    if status == "sent":
-        bot.reply_to(message, f"Today's {kind.upper()} is already marked sent; no duplicate was sent.")
+    state, payload = tx(partial(manual_pick, day=today, kind=kind, word=word))
+
+    if state == "already":
+        bot.reply_to(m, f"ℹ️ Aaj ka {KIND} already '{payload}' hai, resend nahi hoga.")
         return
-    if status == "unknown" and mode != "force":
+    if state == "need_force":
         bot.reply_to(
-            message,
-            f"Today's {kind.upper()} result is unknown. Check the channel first. "
-            f"If it definitely was NOT posted, send /resend_{kind} force.",
+            m,
+            f"⚠️ Aaj ka {KIND} 'unknown' hai.\n"
+            f"Detail: {payload}\n\n"
+            "Pehle channel check karo. Agar post dikh raha hai to kuch mat karo "
+            "(duplicate ho jayega).\n"
+            f"Sirf pakka post nahi hua ho to bhejo: /resend_{kind} force",
         )
         return
-    if status in ("failed", "skipped", "pending") and mode not in ("yes", "force"):
-        bot.reply_to(message, f"To send now, use /resend_{kind} yes.")
+    if state == "need_yes":
+        bot.reply_to(
+            m,
+            f"ℹ️ Aaj ka {KIND} abhi bheja nahi gaya (ya fail hua).\n"
+            f"Abhi bhejna hai to bhejo: /resend_{kind} yes",
+        )
         return
-    if status == "unknown" and mode == "force":
-        # Explicit admin confirmation is required to avoid accidental duplicate posts.
-        pass
+    if state == "empty":
+        bot.reply_to(m, f"❌ {KIND} list khali hai, pehle message add karo.")
+        return
 
-    chosen = choose_message(kind)
-    if not chosen:
-        bot.reply_to(message, f"The {kind.upper()} message list is empty.")
-        return
-    msg_id, text = chosen
-    tx(lambda conn: set_slot(conn, day, kind, "sending", f"manual message #{msg_id}"))
+    msg_id, text = payload
     try:
         bot.send_message(CHANNEL_ID, text)
-    except Exception as exc:
-        tx(lambda conn: set_slot(conn, day, kind, "unknown", f"manual resend: {exc}"))
-        bot.reply_to(message, f"Resend result is unknown: {exc}. Check the channel before trying again.")
+    except Exception as e:
+        verdict, reason = classify(e)
+        if verdict == SAFE_RETRY:
+            tx(partial(release_slot, day=today, kind=kind))
+            bot.reply_to(
+                m,
+                "⏳ Temporary issue, message channel tak nahi gaya.\n"
+                f"{reason}\n"
+                f"Slot release kiya. Thodi der me /resend_{kind} yes bhejo, "
+                "ya scheduler agle poll pe apne aap try karega.",
+            )
+            return
+        status = "failed" if verdict == PERMANENT else "unknown"
+        tx(partial(
+            set_slot, day=today, kind=kind, status=status,
+            detail=f"manual resend: {reason}",
+        ))
+        bot.reply_to(m, f"❌ Resend fail ({status}): {reason}")
         return
-    tx(lambda conn: set_slot(conn, day, kind, "sent", f"manual message #{msg_id}"))
-    bot.reply_to(message, f"✅ {kind.upper()} message sent.")
+
+    tx(partial(
+        set_slot, day=today, kind=kind, status="sent",
+        detail=f"manual msg #{msg_id}",
+    ))
+    bot.reply_to(m, f"✅ {KIND} resend ho gaya")
 
 @bot.message_handler(commands=["status"], chat_types=["private"])
 @admin_only
-def status_cmd(message):
-    day = datetime.now(TZ).strftime("%Y-%m-%d")
-    counts = {
-        kind: query("SELECT COUNT(*) AS total FROM messages WHERE kind=?", (kind,))[0]["total"]
-        for kind in ("gm", "gn")
-    }
+def status(m):
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    gm_count = query("SELECT COUNT(*) AS c FROM messages WHERE kind = 'gm'")[0]["c"]
+    gn_count = query("SELECT COUNT(*) AS c FROM messages WHERE kind = 'gn'")[0]["c"]
+
     def slot_line(kind):
-        planned = get_state(f"{kind}_time", "not planned")
-        rows = query("SELECT status,detail FROM slots WHERE day=? AND kind=?", (day, kind))
+        planned = get_state(f"{kind}_time", "-")
+        rows = query(
+            "SELECT status, detail FROM slots WHERE day = ? AND kind = ?",
+            (today, kind),
+        )
         if rows:
-            detail = f" ({rows[0]['detail']})" if rows[0]["detail"] else ""
-            return f"{planned} IST → {rows[0]['status']}{detail}"
+            st, detail = rows[0]["status"], rows[0]["detail"] or ""
+            extra = f" ({detail})" if detail else ""
+            return f"{planned} IST → {st}{extra}"
         return f"{planned} IST → pending"
+
     bot.reply_to(
-        message,
-        f"📊 Status for {day}\n"
-        f"GM: {slot_line('gm')}\n"
-        f"GN: {slot_line('gn')}\n"
-        f"GM messages: {counts['gm']}\n"
-        f"GN messages: {counts['gn']}\n"
-        f"Grace period: {GRACE_MINUTES} minutes",
+        m,
+        f"📊 Status\n"
+        f"Aaj GM: {slot_line('gm')}\n"
+        f"Aaj GN: {slot_line('gn')}\n"
+        f"GM messages: {gm_count}\n"
+        f"GN messages: {gn_count}\n"
+        f"Grace: {GRACE_MINUTES} min",
     )
+
+# ---------- Main ----------
 
 if __name__ == "__main__":
     init_db()
-    today = datetime.now(TZ).strftime("%Y-%m-%d")
-    tx(lambda conn: ensure_plan(conn, today))
     stale = tx(recover_stale)
-    threading.Thread(target=scheduler, daemon=True, name="scheduler").start()
+    threading.Thread(target=scheduler, daemon=True).start()
+    log.info("Bot start ho gaya")
     for day, kind in stale:
         notify_admin(
-            f"⚠️ {kind.upper()} ({day}) was marked unknown after restart. "
-            "Check the channel before manually resending."
+            f"⚠️ {kind.upper()} ({day}) restart ke waqt send ho raha tha. "
+            "Status 'unknown' set kiya. Channel check karo."
         )
-    log.info("Bot started; timezone Asia/Kolkata")
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
+    bot.infinity_polling(skip_pending=True)
